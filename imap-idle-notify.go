@@ -116,7 +116,8 @@ var (
 	NtfyAuthToken  = env("NTFY_AUTH_TOKEN", "")
 	NtfyPriority   = envInt("NTFY_PRIORITY", 5)
 	NtfyClickAction = env("NTFY_CLICK_ACTION", "")
-
+    NtfyIcon        = env("NTFY_ICON", "")
+	
 	SendMessageBody = envBool("SEND_MESSAGE_BODY", true)
 )
 
@@ -317,6 +318,10 @@ func sendNtfy(sender, subject, body string) {
 		req.Header.Set("Click", NtfyClickAction)
 	}
 
+    if NtfyIcon != "" {
+		req.Header.Set("Icon", NtfyIcon)
+	}
+	
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		slog.Error("ntfy send failed", "err", err)
