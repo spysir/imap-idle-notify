@@ -18,9 +18,10 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap-idle"
-	"github.com/emersion/go-imap-uidplus"
+	idle "github.com/emersion/go-imap-idle"
+	uidplus "github.com/emersion/go-imap-uidplus"
 	"github.com/emersion/go-imap/client"
+	_ "github.com/emersion/go-message/charset"
 	"github.com/emersion/go-message/mail"
 	"github.com/k3a/html2text"
 )
@@ -98,7 +99,7 @@ var (
 
 	FromFilter            = envList("FROM_FILTER", "user@gmail.com,test@example.com")
 	DeleteAfterProcessing = envBool("DELETE_AFTER_PROCESSING", false)
-	IMAPFlag = env("IMAP_FLAG", "\\Seen")
+	IMAPFlag              = env("IMAP_FLAG", "\\Seen")
 
 	CheckFrom = envBool("CHECK_FROM", true)
 	CheckCc   = envBool("CHECK_CC", false)
@@ -107,14 +108,14 @@ var (
 
 	NotifyAllEmails = envBool("NOTIFY_ALL_EMAILS", false)
 
-	NotifierType   = env("NOTIFIER_TYPE", "gotify") // gotify or ntfy
-	GotifyURL      = env("GOTIFY_URL", "")
-	GotifyToken    = env("GOTIFY_TOKEN", "")
-	GotifyPriority = envInt("GOTIFY_PRIORITY", 5)
-	NtfyUrl        = env("NTFY_URL", "https://ntfy.sh")
-	NtfyTopic      = env("NTFY_TOPIC", "")
-	NtfyAuthToken  = env("NTFY_AUTH_TOKEN", "")
-	NtfyPriority   = envInt("NTFY_PRIORITY", 5)
+	NotifierType    = env("NOTIFIER_TYPE", "gotify") // gotify or ntfy
+	GotifyURL       = env("GOTIFY_URL", "")
+	GotifyToken     = env("GOTIFY_TOKEN", "")
+	GotifyPriority  = envInt("GOTIFY_PRIORITY", 5)
+	NtfyUrl         = env("NTFY_URL", "https://ntfy.sh")
+	NtfyTopic       = env("NTFY_TOPIC", "")
+	NtfyAuthToken   = env("NTFY_AUTH_TOKEN", "")
+	NtfyPriority    = envInt("NTFY_PRIORITY", 5)
 	NtfyClickAction = env("NTFY_CLICK_ACTION", "")
 
 	SendMessageBody = envBool("SEND_MESSAGE_BODY", true)
