@@ -1,6 +1,6 @@
 module imap_idle_ntfy
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/emersion/go-imap v1.2.1
