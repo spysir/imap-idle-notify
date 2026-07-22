@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -12,9 +13,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -23,7 +26,9 @@ import (
 	"github.com/emersion/go-imap/client"
 	_ "github.com/emersion/go-message/charset"
 	"github.com/emersion/go-message/mail"
+	"github.com/joho/godotenv"
 	"github.com/k3a/html2text"
+	"golang.org/x/time/rate"
 )
 
 // --- ENV Helpers ---
@@ -86,6 +91,15 @@ func initLogger() {
 	slog.SetDefault(slog.New(handler))
 }
 
+var _ = loadDotenv()
+
+func loadDotenv() bool {
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "warning: failed to load .env: %v\n", err)
+	}
+	return true
+}
+
 // --- Config ---
 var (
 	IMAPHost = env("IMAP_HOST", "imap.example.com")
@@ -96,6 +110,8 @@ var (
 	IMAPCACert = env("IMAP_CA_CERT", "")
 	IMAPCert   = env("IMAP_CLIENT_CERT", "")
 	IMAPKey    = env("IMAP_CLIENT_KEY", "")
+
+	IMAPFolder = env("IMAP_FOLDER", "INBOX")
 
 	FromFilter            = envList("FROM_FILTER", "user@gmail.com,test@example.com")
 	DeleteAfterProcessing = envBool("DELETE_AFTER_PROCESSING", false)
@@ -119,6 +135,7 @@ var (
 	NtfyClickAction = env("NTFY_CLICK_ACTION", "")
 
 	SendMessageBody = envBool("SEND_MESSAGE_BODY", true)
+	DebugEmail      = envBool("DEBUG_EMAIL", false)
 )
 
 // shared HTTP client (connection reuse + single timeout)
@@ -143,6 +160,9 @@ const (
 	idleRefresh   = 29 * time.Minute
 	healthSlack   = 2 * time.Minute
 	healthTimeout = idleRefresh + healthSlack
+
+	connectTimeout = 10 * time.Second
+	loginTimeout   = 15 * time.Second
 )
 
 var (
@@ -155,6 +175,7 @@ var (
 var health struct {
 	lastHealthyUnixNano atomic.Int64
 	consecutiveFailures atomic.Int64
+	shuttingDown        atomic.Bool
 }
 
 func markHealthy() {
@@ -166,7 +187,14 @@ func markFailure() {
 	health.consecutiveFailures.Add(1)
 }
 
+func markShuttingDown() {
+	health.shuttingDown.Store(true)
+}
+
 func healthy() bool {
+	if health.shuttingDown.Load() {
+		return false
+	}
 	last := health.lastHealthyUnixNano.Load()
 	if last == 0 || time.Since(time.Unix(0, last)) > healthTimeout {
 		return false
@@ -176,7 +204,7 @@ func healthy() bool {
 
 // startHealthServer serves GET /healthz on localhost for the HEALTHCHECK probe
 // (same network namespace, so 127.0.0.1 is reachable).
-func startHealthServer() {
+func startHealthServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if healthy() {
@@ -188,12 +216,14 @@ func startHealthServer() {
 		_, _ = io.WriteString(w, "unhealthy\n")
 	})
 	addr := fmt.Sprintf("127.0.0.1:%d", HealthPort)
+	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		slog.Debug("health endpoint listening", "addr", addr+"/healthz")
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("health server stopped", "err", err)
 		}
 	}()
+	return srv
 }
 
 // runHealthProbe is the -healthcheck mode: probe /healthz and exit 0/1.
@@ -245,8 +275,42 @@ func loadTLSConfig() (*tls.Config, error) {
 // htmlToText extracts the visible text from an HTML body. It drops <script>
 // and <style> contents so inline CSS and tracking JavaScript never reach the
 // notification.
+
 func htmlToText(htmlStr string) string {
-	return strings.TrimSpace(html2text.HTML2Text(htmlStr))
+	// Limit input size to prevent DoS
+	if len(htmlStr) > 100000 {
+		htmlStr = htmlStr[:100000] + "..."
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("HTML parsing panic recovered", "recover", r)
+		}
+	}()
+
+	// Set a timeout for HTML parsing
+	done := make(chan string, 1)
+	go func() {
+		done <- html2text.HTML2Text(htmlStr)
+	}()
+
+	select {
+	case text := <-done:
+		return strings.TrimSpace(text)
+	case <-time.After(2 * time.Second):
+		slog.Warn("HTML parsing timeout")
+		return "HTML parsing timeout"
+	}
+}
+
+// --- Sanitizer ---
+func sanitizeEmailHeader(s string) string {
+	// Remove control characters and limit length
+	s = headerSafe(s)
+	if len(s) > 200 {
+		s = s[:200] + "..."
+	}
+	return s
 }
 
 // --- Notifiers ---
@@ -278,7 +342,6 @@ func sendGotify(sender, subject, body string) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		slog.Error("gotify request creation failed", "err", err)
-		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Token in a header keeps it out of access logs and proxies
@@ -332,7 +395,14 @@ func sendNtfy(sender, subject, body string) {
 	}
 }
 
+// --- Rate limiter ---
+var notifierRateLimiter = rate.NewLimiter(rate.Limit(10), 5) // 10 notifications/sec, burst 5
+
 func sendNotification(sender, subject, body string) {
+	if err := notifierRateLimiter.Wait(context.Background()); err != nil {
+		slog.Error("rate limiter error", "err", err)
+		return
+	}
 	switch NotifierType {
 	case "ntfy":
 		sendNtfy(sender, subject, body)
@@ -393,6 +463,15 @@ func shouldNotify(env *imap.Envelope) bool {
 
 // validateConfig rejects configurations that could never produce a notification.
 func validateConfig() error {
+	if NotifierType != "gotify" && NotifierType != "ntfy" {
+		return fmt.Errorf("invalid NOTIFIER_TYPE: %s (must be 'gotify' or 'ntfy')", NotifierType)
+	}
+	if NotifierType == "gotify" && (GotifyURL == "" || GotifyToken == "") {
+		return fmt.Errorf("gotify requires GOTIFY_URL and GOTIFY_TOKEN")
+	}
+	if NotifierType == "ntfy" && NtfyTopic == "" {
+		return fmt.Errorf("ntfy requires NTFY_TOPIC")
+	}
 	if NotifyAllEmails {
 		return nil
 	}
@@ -403,6 +482,8 @@ func validateConfig() error {
 	}
 	return fmt.Errorf("no notifications possible: set NOTIFY_ALL_EMAILS=true or enable at least one CHECK_* filter")
 }
+
+const maxMIMEParts = 100
 
 // --- Message Processing ---
 func processMessage(c *client.Client, msg *imap.Message, section *imap.BodySectionName) {
@@ -430,7 +511,11 @@ func processMessage(c *client.Client, msg *imap.Message, section *imap.BodySecti
 			return
 		}
 
-		for {
+		for i := 0; ; i++ {
+			if i >= maxMIMEParts {
+				slog.Warn("message has too many MIME parts, giving up on body extraction", "subject", msg.Envelope.Subject)
+				break
+			}
 			p, err := mr.NextPart()
 			if err == io.EOF {
 				break
@@ -455,10 +540,10 @@ func processMessage(c *client.Client, msg *imap.Message, section *imap.BodySecti
 	}
 
 SEND:
-	subject := msg.Envelope.Subject
+	subject := sanitizeEmailHeader(msg.Envelope.Subject)
 	sender := ""
 	if len(msg.Envelope.From) > 0 {
-		sender = strings.ToLower(msg.Envelope.From[0].MailboxName + "@" + msg.Envelope.From[0].HostName)
+		sender = sanitizeEmailHeader(strings.ToLower(msg.Envelope.From[0].MailboxName + "@" + msg.Envelope.From[0].HostName))
 	}
 
 	sendNotification(sender, subject, bodyText)
@@ -469,6 +554,10 @@ SEND:
 	flags := []interface{}{IMAPFlag}
 	if err := c.Store(seqset, imap.FormatFlagsOp(imap.AddFlags, true), flags, nil); err != nil {
 		slog.Error("failed to add flag", "flag", IMAPFlag, "err", err)
+	}
+
+	if DebugEmail {
+		slog.Debug("raw message", "uid", msg.Uid, "flags", msg.Flags)
 	}
 
 	if DeleteAfterProcessing {
@@ -492,13 +581,15 @@ SEND:
 			slog.Warn("server lacks UIDPLUS; message stays flagged \\Deleted until next expunge")
 		}
 	}
+
 }
 
 // --- Fetch Unseen ---
 func fetchUnseen(c *client.Client, section *imap.BodySectionName) {
 	slog.Debug("fetching unseen messages")
 	criteria := imap.NewSearchCriteria()
-	criteria.WithoutFlags = []string{IMAPFlag, imap.SeenFlag}
+	//criteria.WithoutFlags = []string{IMAPFlag, imap.SeenFlag}
+	criteria.WithoutFlags = []string{IMAPFlag}
 	ids, err := c.Search(criteria)
 	if err != nil {
 		slog.Error("search for unseen messages failed", "err", err)
@@ -525,7 +616,13 @@ func fetchUnseen(c *client.Client, section *imap.BodySectionName) {
 }
 
 // --- Single IMAP session ---
-func runIMAPSession() error {
+func runIMAPSession(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	tlsConfig, err := loadTLSConfig()
 	if err != nil {
 		return err
@@ -533,7 +630,9 @@ func runIMAPSession() error {
 
 	addr := fmt.Sprintf("%s:%d", IMAPHost, IMAPPort)
 	slog.Debug("connecting to IMAP server", "addr", addr)
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+
+	dialer := &net.Dialer{Timeout: connectTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("IMAP connection error: %w", err)
 	}
@@ -545,15 +644,24 @@ func runIMAPSession() error {
 		_ = c.Logout()
 	}()
 
+	if err := conn.SetDeadline(time.Now().Add(loginTimeout)); err != nil {
+		return fmt.Errorf("set login deadline: %w", err)
+	}
+
 	if err := c.Login(IMAPUser, IMAPPass); err != nil {
 		return fmt.Errorf("IMAP login error: %w", err)
 	}
 	slog.Debug("logged in successfully")
 
-	if _, err = c.Select("INBOX", false); err != nil {
-		return fmt.Errorf("Select INBOX error: %w", err)
+	if _, err = c.Select(IMAPFolder, false); err != nil {
+		return fmt.Errorf("Select %s error: %w", IMAPFolder, err)
 	}
-	markHealthy() // login + mailbox round-trip succeeded
+
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear login deadline: %w", err)
+	}
+
+	markHealthy()
 
 	// Use PEEK to avoid setting \Seen during fetch
 	section := &imap.BodySectionName{Peek: true}
@@ -564,11 +672,20 @@ func runIMAPSession() error {
 
 	updates := make(chan client.Update, 16)
 	c.Updates = updates
+
 	for {
+		// Check for context cancellation before each IDLE cycle
+		select {
+		case <-ctx.Done():
+			slog.Info("shutting down IMAP session due to context cancellation")
+			return ctx.Err()
+		default:
+		}
+
 		stopIdle := make(chan struct{})
 		idleDone := make(chan error, 1)
 
-		markHealthy() // actively (re)entering IDLE
+		markHealthy()
 
 		go func() {
 			idleDone <- idleClient.Idle(stopIdle)
@@ -576,7 +693,6 @@ func runIMAPSession() error {
 
 		select {
 		case <-updates:
-			// New updates; stop IDLE, handle unseen, resume
 			close(stopIdle)
 			if err := <-idleDone; err != nil {
 				return fmt.Errorf("idle ended with error: %w", err)
@@ -584,18 +700,22 @@ func runIMAPSession() error {
 			fetchUnseen(c, section)
 
 		case err := <-idleDone:
-			// Idle ended unexpectedly (likely disconnect)
 			if err != nil {
 				return fmt.Errorf("idle error: %w", err)
 			}
-			// No error: loop will start IDLE again
+
 		case <-time.After(idleRefresh):
-			// RFC: break IDLE periodically to send a command
 			close(stopIdle)
 			if err := <-idleDone; err != nil {
 				return fmt.Errorf("idle ended with error: %w", err)
 			}
-			// Loop to start IDLE again
+
+		case <-ctx.Done():
+			// Context cancelled - stop IDLE and exit
+			close(stopIdle)
+			<-idleDone // Wait for idle to stop
+			slog.Info("shutting down IMAP session")
+			return ctx.Err()
 		}
 	}
 }
@@ -614,23 +734,60 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Info("received shutdown signal")
+		markShuttingDown()
+		cancel()
+	}()
+
 	slog.Info("starting IMAP notifier")
 
-	startHealthServer()
+	healthSrv := startHealthServer()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := healthSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("health server shutdown error", "err", err)
+		} else {
+			slog.Debug("health server shut down gracefully")
+		}
+	}()
 
 	backoff := 2 * time.Second
 	const maxBackoff = 1 * time.Minute
 
 	for {
-		if err := runIMAPSession(); err != nil {
+		select {
+		case <-ctx.Done():
+			slog.Info("shutting down due to context cancellation")
+			return
+		default:
+		}
+
+		if err := runIMAPSession(ctx); err != nil {
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				slog.Info("session cancelled gracefully")
+				return
+			}
 			slog.Error("session ended with error", "err", err)
 			markFailure()
 		} else {
-			return // graceful exit (unlikely in normal runs)
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
 		}
 
 		slog.Warn("reconnecting after backoff", "backoff", backoff)
-		time.Sleep(backoff)
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
